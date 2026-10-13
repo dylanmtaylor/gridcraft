@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, channel};
 
 use gridcraft_ui_egui::SheetApp;
 use muda::accelerator::Accelerator;
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use serde_json::{Value, json};
 
 type Entry = (&'static str, &'static str, Option<&'static str>);
@@ -24,13 +24,14 @@ fn tree() -> Vec<(&'static str, Vec<Entry>)> {
                 ("Close", "file.close", Some("CMD+W")),
                 ("Save", "file.save", Some("CMD+S")),
                 ("Save As…", "file.saveAs", Some("CMD+SHIFT+S")),
+                ("Export as PDF…", "file.exportPdf", None),
                 ("Export as CSV…", "dialog:saveCopy:csv", None),
                 ("Save as Web Page…", "dialog:saveCopy:html", None),
                 ("-", "", None),
                 ("Page Setup…", "dialog:pageSetup", None),
                 ("Print…", "file.print", Some("CMD+P")),
                 ("-", "", None),
-                ("Properties…", "file.properties", None),
+                ("Properties…", "dialog:backstage:info", None),
             ],
         ),
         (
@@ -78,7 +79,7 @@ fn tree() -> Vec<(&'static str, Vec<Entry>)> {
                 ("Freeze Top Row", "view.freezeTopRow", None),
                 ("Unfreeze Panes", "view.unfreezePanes", None),
                 ("-", "", None),
-                ("Dark Mode", "view.darkMode", None),
+                ("Display Theme", "view.theme", None),
                 ("Collapse Ribbon", "view.collapseRibbon", Some("CMD+ALT+R")),
             ],
         ),
@@ -160,6 +161,8 @@ fn tree() -> Vec<(&'static str, Vec<Entry>)> {
                 ("-", "", None),
                 ("Group", "data.group", None),
                 ("Ungroup", "data.ungroup", None),
+                ("Show Detail", "data.showDetail", None),
+                ("Hide Detail", "data.hideDetail", None),
                 ("Subtotal…", "dialog:subtotal", None),
                 ("-", "", None),
                 ("Calculate Now", "formulas.calculateNow", None),
@@ -181,6 +184,18 @@ fn tree() -> Vec<(&'static str, Vec<Entry>)> {
 pub struct NativeMenu {
     _menu: Menu,
     events: Receiver<MenuEvent>,
+    theme_items: Vec<(&'static str, CheckMenuItem)>,
+}
+
+fn select_theme(app: &mut SheetApp, id: &str) -> bool {
+    let mode = match id {
+        "theme:system" => "system",
+        "theme:light" => "light",
+        "theme:dark" => "dark",
+        _ => return false,
+    };
+    app.run_or_alert("view.theme", json!({"mode": mode}));
+    true
 }
 
 impl NativeMenu {
@@ -200,6 +215,8 @@ impl NativeMenu {
             &PredefinedMenuItem::quit(None),
         ]);
         let _ = menu.append(&app_menu);
+        let mut theme_items = Vec::new();
+        let mut window_menu = None;
         for (title, entries) in tree() {
             let sub = Submenu::new(title, true);
             for (label, id, acc) in entries {
@@ -207,25 +224,72 @@ impl NativeMenu {
                     let _ = sub.append(&PredefinedMenuItem::separator());
                     continue;
                 }
+                if id == "view.theme" {
+                    let themes = Submenu::new(label, true);
+                    for (mode, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
+                        let item = CheckMenuItem::with_id(format!("theme:{mode}"), label, true, false, None);
+                        let _ = themes.append(&item);
+                        theme_items.push((mode, item));
+                    }
+                    let _ = sub.append(&themes);
+                    continue;
+                }
                 let accel = acc.and_then(|a| Accelerator::from_str(a).ok());
                 let item = MenuItem::with_id(id, label, true, accel);
                 let _ = sub.append(&item);
             }
             let _ = menu.append(&sub);
+            if title == "Window" {
+                window_menu = Some(sub);
+            }
         }
         menu.init_for_nsapp();
+        // NSApp's windowsMenu is where macOS adds Move & Resize, Fill and Center, the targets of the
+        // system tiling shortcuts (Fn+Ctrl+arrows, Fn+F). Only once the menu is NSApp's: muda looks
+        // the submenu up in the installed main menu.
+        if let Some(window) = window_menu {
+            window.set_as_windows_menu_for_nsapp();
+        }
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             let _ = tx.send(e);
             ctx.request_repaint();
         }));
-        NativeMenu { _menu: menu, events: rx }
+        NativeMenu { _menu: menu, events: rx, theme_items }
     }
 
     pub fn poll(&self, app: &mut SheetApp, ctx: &egui::Context) {
         while let Ok(ev) = self.events.try_recv() {
             let id = ev.id.as_ref().to_string();
+            // Text selection belongs to the inline editor, not the worksheet clipboard/undo.
+            if app.text_box_editor.is_some() {
+                let clipboard = match id.as_str() {
+                    "edit.copy" => Some(egui::ViewportCommand::RequestCopy),
+                    "edit.cut" => Some(egui::ViewportCommand::RequestCut),
+                    "edit.paste" => Some(egui::ViewportCommand::RequestPaste),
+                    _ => None,
+                };
+                if let Some(command) = clipboard {
+                    ctx.send_viewport_cmd(command);
+                    continue;
+                }
+                if id == "edit.undo" || id == "edit.redo" {
+                    ctx.input_mut(|i| {
+                        i.events.push(egui::Event::Key {
+                            key: egui::Key::Z,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers { command: true, mac_cmd: true, shift: id == "edit.redo", ..Default::default() },
+                        });
+                    });
+                    continue;
+                }
+            }
+            if select_theme(app, &id) {
+                continue;
+            }
             if let Some(url) = id.strip_prefix("url:") {
                 if let Some(open) = &app.services.open_url {
                     open(url);
@@ -238,19 +302,50 @@ impl NativeMenu {
                     ("note", _) => json!({"threaded": false}),
                     ("comment", _) => json!({"threaded": true}),
                     ("about", tab) => json!({"tab": tab}),
+                    ("backstage", page) => json!({"page": page}),
                     _ => json!({}),
                 };
                 let name = if name == "note" { "comment" } else { name };
                 app.open_dialog(name, params);
             } else if id == "edit.copy" || id == "edit.cut" {
-                if let Ok(r) = app.run(&id, json!({}))
-                    && let Some(t) = r.get("text").and_then(Value::as_str)
-                {
-                    ctx.copy_text(t.to_string());
-                }
+                app.copy_to_clipboard(ctx, &id);
+            } else if id == "edit.paste" {
+                app.paste_from_clipboard();
             } else {
                 app.run_or_alert(&id, json!({}));
             }
         }
+        for (mode, item) in &self.theme_items {
+            let checked = app.ui.theme_mode() == *mode;
+            if item.is_checked() != checked {
+                item.set_checked(checked);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_menu_has_export_as_pdf_dispatching_the_command() {
+        let tree = tree();
+        let (_, file) = tree.iter().find(|(title, _)| *title == "File").expect("File menu");
+        let item = file.iter().find(|e| e.0 == "Export as PDF…").expect("Export as PDF… in the File menu");
+        assert_eq!(item.1, "file.exportPdf");
+        assert!(gridcraft_engine::find_command("file.exportPdf").is_some());
+    }
+
+    #[test]
+    fn theme_choices_use_the_shared_preference_command() {
+        let mut app = SheetApp::new(gridcraft_engine::Session::new(), Default::default());
+        for mode in ["dark", "system", "light"] {
+            assert!(select_theme(&mut app, &format!("theme:{mode}")));
+            assert_eq!(app.ui.theme_mode(), mode);
+            assert!(app.message.is_none());
+        }
+        assert!(!select_theme(&mut app, "view.formulaBar"));
+        assert_eq!(app.ui.theme_mode(), "light");
     }
 }

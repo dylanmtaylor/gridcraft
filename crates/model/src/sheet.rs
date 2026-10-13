@@ -1,11 +1,12 @@
 //! Worksheets.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value};
 use serde::{Deserialize, Serialize};
 
-use crate::cell::Cell;
+use crate::cell::{Cell, CellPicture};
 use crate::features::*;
 use crate::store::CellStore;
 use crate::style::{Color, StyleId};
@@ -18,10 +19,43 @@ pub enum Visibility {
     VeryHidden,
 }
 
+/// How a sheet is displayed (View › Workbook Views; `<sheetView view="…">` in XLSX).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SheetViewMode {
+    #[default]
+    Normal,
+    /// Pages on paper with rulers, margins and in-place headers and footers.
+    PageLayout,
+    PageBreakPreview,
+}
+
+impl SheetViewMode {
+    /// The XLSX / command spelling: `normal`, `pageLayout` or `pageBreakPreview`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SheetViewMode::Normal => "normal",
+            SheetViewMode::PageLayout => "pageLayout",
+            SheetViewMode::PageBreakPreview => "pageBreakPreview",
+        }
+    }
+    pub fn parse(s: &str) -> Option<SheetViewMode> {
+        match s {
+            "normal" => Some(SheetViewMode::Normal),
+            "pageLayout" => Some(SheetViewMode::PageLayout),
+            "pageBreakPreview" => Some(SheetViewMode::PageBreakPreview),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sheet {
     pub name: String,
     pub cells: CellStore,
+    /// Static pictures are sparse rich content. Ordinary cells carry no picture pointer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "picture_map")]
+    pub cell_pictures: BTreeMap<CellRef, Arc<CellPicture>>,
     /// Values spilled by dynamic-array formulas (maintained by calc), keyed by cell.
     #[serde(skip)]
     pub spill: BTreeMap<CellRef, Value>,
@@ -48,31 +82,53 @@ pub struct Sheet {
     pub validations: Vec<Validation>,
     pub tables: Vec<Table>,
     pub autofilter: Option<AutoFilter>,
+    #[serde(with = "crate::cellmap")]
     pub comments: BTreeMap<CellRef, Comment>,
+    #[serde(with = "crate::cellmap")]
     pub hyperlinks: BTreeMap<CellRef, Hyperlink>,
     pub charts: Vec<Chart>,
     pub images: Vec<Image>,
     pub shapes: Vec<Shape>,
     pub sparklines: Vec<Sparkline>,
+    /// On-sheet slicer widgets (filter a table column by clicking value tiles).
+    #[serde(default)]
+    pub slicers: Vec<Slicer>,
     /// PivotTables whose output lives on this sheet.
     #[serde(default)]
     pub pivots: Vec<PivotTable>,
     pub protection: Option<SheetProtection>,
+    /// Allow Edit Ranges (meaningful while the sheet is protected).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_ranges: Vec<crate::EditRange>,
     pub print: PrintSettings,
     /// Last selection and scroll position, saved with the file.
     pub view_active: CellRef,
     pub view_top_left: CellRef,
+    /// Normal, Page Layout or Page Break Preview.
+    #[serde(default)]
+    pub view: SheetViewMode,
+    /// Unmodelled file content of this sheet kept for saving (form controls, OLE objects, query
+    /// tables). Goes away with the sheet; not in JSON.
+    #[serde(skip)]
+    pub preserved: Option<Arc<crate::preserved::Preserved>>,
 }
 
 /// Default width of a column (points) and height of a row (points) for the default font.
 pub const DEFAULT_COL_WIDTH: f32 = 64.0;
 pub const DEFAULT_ROW_HEIGHT: f32 = 20.0;
 
+/// Column width (points) → characters of the default font's digit width (7 px), without the
+/// cell padding: the value the Column Width dialog shows.
+pub fn points_to_chars(px: f64) -> f64 {
+    if px <= 12.0 { (px / 12.0 * 100.0).round() / 100.0 } else { ((px - 5.0) / 7.0 * 100.0 + 0.5).trunc() / 100.0 }
+}
+
 impl Sheet {
     pub fn new(name: impl Into<String>) -> Sheet {
         Sheet {
             name: name.into(),
             cells: CellStore::new(),
+            cell_pictures: BTreeMap::new(),
             spill: BTreeMap::new(),
             spill_ranges: BTreeMap::new(),
             cols: BTreeMap::new(),
@@ -99,11 +155,15 @@ impl Sheet {
             images: vec![],
             shapes: vec![],
             sparklines: vec![],
+            slicers: vec![],
             pivots: vec![],
             protection: None,
+            edit_ranges: vec![],
             print: PrintSettings::default(),
             view_active: CellRef::default(),
             view_top_left: CellRef::default(),
+            view: SheetViewMode::Normal,
+            preserved: None,
         }
     }
 
@@ -134,7 +194,30 @@ impl Sheet {
     }
     pub fn set_value(&mut self, c: CellRef, v: Value) {
         let style = self.style_id(c);
-        self.cells.set(c, Cell { value: v, formula: None, style });
+        self.set_cell(c, Cell { value: v, formula: None, style });
+    }
+    /// Replaces content, removing any picture at this address. Style-only edits use set_style.
+    pub fn set_cell(&mut self, c: CellRef, cell: Cell) {
+        self.cell_pictures.remove(&c);
+        self.cells.set(c, cell);
+    }
+    pub fn remove_cell(&mut self, c: CellRef) -> Option<Cell> {
+        self.cell_pictures.remove(&c);
+        self.cells.remove(c)
+    }
+    /// Removes content in a range; returns scalar cells, with pictures removed from the side map.
+    pub fn take_cells(&mut self, range: RangeRef) -> Vec<(CellRef, Cell)> {
+        self.cell_pictures.retain(|c, _| !range.contains(*c));
+        self.cells.take_range(range)
+    }
+    /// Pictures retain a scalar fallback for calculation and unsupported consumers.
+    pub fn set_picture(&mut self, c: CellRef, picture: Arc<CellPicture>) {
+        let style = self.style_id(c);
+        self.cells.set(c, Cell { value: Value::Error(gridcraft_core::CellError::Value), formula: None, style });
+        self.cell_pictures.insert(c, picture);
+    }
+    pub fn input_text(&self, c: CellRef) -> String {
+        if self.cell_pictures.contains_key(&c) { String::new() } else { self.cell(c).map(Cell::input_text).unwrap_or_default() }
     }
     pub fn set_style(&mut self, c: CellRef, style: StyleId) {
         let mut cell = self.cells.get(c).cloned().unwrap_or_default();
@@ -143,6 +226,20 @@ impl Sheet {
     }
 
     // ---- geometry
+
+    /// Whether this cell has a table or ordinary AutoFilter dropdown.
+    pub fn has_filter_button(&self, c: CellRef) -> bool {
+        self.autofilter.as_ref().is_some_and(|af| af.range.start.row == c.row && af.range.contains(c))
+            || self.tables.iter().any(|t| t.filter_button && t.header_row && t.range.start.row == c.row && t.range.contains(c))
+    }
+
+    /// Horizontal header space in unzoomed grid units (96 units per inch).
+    /// Observed in Windows Excel 16.0 build 20326: AutoFit reserves 12.5 pt at
+    /// 100-200% zoom, 25 pt at 50%, regardless of header row height. Below 100%
+    /// the dropdown keeps its screen width. This is geometry, not font padding.
+    pub fn filter_button_space(&self, c: CellRef) -> f32 {
+        if self.has_filter_button(c) { (12.5 * 96.0 / 72.0) / (self.zoom as f32 / 100.0).clamp(0.1, 1.0) } else { 0.0 }
+    }
 
     pub fn col_width(&self, col: u32) -> f32 {
         match self.cols.get(&col) {
@@ -160,6 +257,17 @@ impl Sheet {
     }
     pub fn is_row_hidden(&self, row: u32) -> bool {
         self.rows.get(&row).is_some_and(|r| r.hidden)
+    }
+    /// Whether `row` is hidden by an applied filter: a hidden row below the header of the
+    /// sheet AutoFilter while it has criteria, or a hidden data row of a filtered table.
+    /// Other hidden rows were hidden by hand.
+    pub fn is_row_filtered(&self, row: u32) -> bool {
+        if !self.is_row_hidden(row) {
+            return false;
+        }
+        let in_sheet_filter =
+            self.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty() && row > af.range.start.row && row <= af.range.end.row);
+        in_sheet_filter || self.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
     }
     pub fn is_col_hidden(&self, col: u32) -> bool {
         self.cols.get(&col).is_some_and(|r| r.hidden)
@@ -337,5 +445,17 @@ mod tests {
         assert_eq!(s.col_at(1e12), gridcraft_core::MAX_COLS - 1);
         assert_eq!(s.col_at(-5.0), 0);
         assert_eq!(s.col_left(2), 128.0);
+    }
+}
+
+// CellRef is a struct, so encode the sparse map as entries for JSON as well as other formats.
+mod picture_map {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(map: &BTreeMap<CellRef, Arc<CellPicture>>, serializer: S) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<CellRef, Arc<CellPicture>>, D::Error> {
+        Ok(Vec::<(CellRef, Arc<CellPicture>)>::deserialize(deserializer)?.into_iter().collect())
     }
 }
