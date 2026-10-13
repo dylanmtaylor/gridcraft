@@ -4,12 +4,14 @@
 use std::fmt::Write as _;
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS};
-use gridcraft_model::{Anchor, Color, Image, Shape, ShapeKind, Sheet, Theme};
+use gridcraft_model::{Anchor, AnchorMode, Color, Image, Shape, ShapeFormat, ShapeKind, ShapeTextAlign, ShapeTextAnchor, Sheet, Theme};
 
 use crate::IoError;
 use crate::read::Ctx;
 use crate::tables::EMU_PER_PX;
 use crate::xml::{El, esc, esc_attr};
+
+mod ink;
 
 // ---------------------------------------------------------------- reading
 
@@ -40,12 +42,19 @@ fn read_anchor(a: &El, sheet: &Sheet) -> Option<Anchor> {
             let y1 = sheet.row_top(cell.row) + dy as f64;
             let x2 = sheet.col_left(to.col) + tdx as f64;
             let y2 = sheet.row_top(to.row) + tdy as f64;
-            Some(Anchor { cell, dx, dy, width: (x2 - x1).max(0.0) as f32, height: (y2 - y1).max(0.0) as f32 })
+            // Excel stores "Move and size with cells" as a plain twoCellAnchor, "Move but don't
+            // size" as editAs="oneCell", and "Don't move or size" as editAs="absolute".
+            let mode = match a.attr("editAs") {
+                Some("absolute") => AnchorMode::Absolute,
+                Some("oneCell") => AnchorMode::MoveOnly,
+                _ => AnchorMode::MoveAndSize,
+            };
+            Some(Anchor { cell, dx, dy, width: (x2 - x1).max(0.0) as f32, height: (y2 - y1).max(0.0) as f32, mode })
         }
         "oneCellAnchor" => {
             let (cell, dx, dy) = marker(a.child("from")?);
             let (width, height) = ext_px(a.child("ext"));
-            Some(Anchor { cell, dx, dy, width, height })
+            Some(Anchor { cell, dx, dy, width, height, mode: AnchorMode::MoveOnly })
         }
         "absoluteAnchor" => {
             let pos = a.child("pos");
@@ -60,6 +69,7 @@ fn read_anchor(a: &El, sheet: &Sheet) -> Option<Anchor> {
                 dy: (y - sheet.row_top(row)).max(0.0) as f32,
                 width,
                 height,
+                mode: AnchorMode::Absolute,
             })
         }
         _ => None,
@@ -116,7 +126,22 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
     let rels = cx.pkg.rels(part)?;
     for a in &x.children {
         let Some(anchor) = read_anchor(a, sheet) else { continue };
-        for obj in &a.children {
+        // Objects in markup-compatibility blocks: the first choice (chartex frames), else the
+        // fallback.
+        let objs: Vec<&El> = a
+            .children
+            .iter()
+            .flat_map(|o| match o.name.as_str() {
+                "AlternateContent" => o
+                    .child("Choice")
+                    .filter(|c| c.child("graphicFrame").is_some())
+                    .or_else(|| o.child("Fallback"))
+                    .map(|c| c.children.iter().collect())
+                    .unwrap_or_default(),
+                _ => vec![o],
+            })
+            .collect();
+        for obj in objs {
             match obj.name.as_str() {
                 "pic" => {
                     let Some(rid) = obj.path(&["blipFill", "blip"]).and_then(|b| b.attr("embed")) else { continue };
@@ -140,7 +165,8 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                         let Some(rel) = rels.iter().find(|r| r.id == rid) else { continue };
                         let target = rel.target.clone();
                         if let Some(cx_xml) = cx.optional_xml(&target)? {
-                            match crate::chart::read_chart(&cx_xml) {
+                            let chartex = uri.contains("chartex");
+                            match if chartex { crate::chartex::read_chartex(&cx_xml) } else { crate::chart::read_chart(&cx_xml) } {
                                 Some(mut ch) => {
                                     ch.id = cx.next_object_id();
                                     ch.anchor = anchor;
@@ -150,7 +176,7 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                             }
                         }
                     } else if uri.contains("chartex") || uri.contains("chartEx") {
-                        cx.warn("Excel 2016 chart types (histogram, waterfall, treemap…) are not supported yet and were skipped");
+                        cx.warn("a histogram, waterfall, treemap… chart without its chart part was skipped");
                     } else {
                         cx.warn("an embedded object (SmartArt, OLE…) was skipped");
                     }
@@ -171,6 +197,9 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
 
 fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
     let sp = obj.child("spPr")?;
+    if let Some(shape) = ink::read(obj, anchor) {
+        return Some(shape);
+    }
     let prst = sp.child("prstGeom").and_then(|g| g.attr("prst")).unwrap_or("rect");
     let tx_box = obj.path(&["nvSpPr", "cNvSpPr"]).is_some_and(|c| c.flag("txBox", false));
     let ln = sp.child("ln");
@@ -193,13 +222,54 @@ fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
             tb.kids("p").map(|p| p.kids("r").filter_map(|r| r.child("t")).map(|t| t.text.as_str()).collect::<String>()).collect::<Vec<_>>().join("\n")
         })
         .unwrap_or_default();
-    Some(Shape { id: 0, kind, anchor, fill, line, text })
+    let mut format = read_text_format(obj.child("txBody"));
+    format.no_line = ln.is_some_and(|l| l.child("noFill").is_some());
+    Some(Shape { id: 0, kind, anchor, fill, line, text, format })
+}
+
+/// A shape's text formatting: vertical anchor (`a:bodyPr anchor`), the first paragraph's
+/// alignment (`a:pPr algn`) and the first run's properties (`a:rPr`: size, bold, italic, fill,
+/// outline, `a:latin` typeface).
+fn read_text_format(body: Option<&El>) -> ShapeFormat {
+    let mut f = ShapeFormat::default();
+    let Some(body) = body else { return f };
+    f.anchor = body.child("bodyPr").and_then(|b| b.attr("anchor")).map(|a| match a {
+        "ctr" => ShapeTextAnchor::Middle,
+        "b" => ShapeTextAnchor::Bottom,
+        _ => ShapeTextAnchor::Top,
+    });
+    let first_p = body.kids("p").next();
+    f.align = first_p.and_then(|p| p.child("pPr")).and_then(|p| p.attr("algn")).map(|a| match a {
+        "ctr" => ShapeTextAlign::Center,
+        "r" => ShapeTextAlign::Right,
+        _ => ShapeTextAlign::Left,
+    });
+    let rpr = body.kids("p").flat_map(|p| p.kids("r")).find_map(|r| r.child("rPr"));
+    if let Some(r) = rpr {
+        // `sz` is in hundredths of a point (100..=400000 in the schema).
+        f.font_size = r.attr_f64("sz").filter(|v| v.is_finite()).map(|v| (v / 100.0).clamp(1.0, 4000.0) as f32);
+        f.bold = r.flag("b", false);
+        f.italic = r.flag("i", false);
+        f.font = r.child("latin").and_then(|l| l.attr("typeface")).filter(|t| !t.is_empty() && !t.starts_with('+')).map(str::to_string);
+        f.text_color = r.child("solidFill").and_then(dml_color);
+        f.text_outline = r.child("ln").and_then(|l| {
+            let c = l.child("solidFill").and_then(dml_color)?;
+            // Width in EMU (12700 per point); Excel's default hairline is 0.75 pt.
+            let w = l.attr_f64("w").filter(|w| w.is_finite()).map_or(0.75, |w| (w / 12700.0).clamp(0.0, 100.0)) as f32;
+            Some((c, w))
+        });
+    }
+    f
 }
 
 // ---------------------------------------------------------------- writing
 
-/// `<xdr:from>`/`<xdr:to>` markers for a model anchor.
-fn anchor_open(sheet: &Sheet, a: &Anchor) -> String {
+/// The opening `<xdr:twoCellAnchor>` for a model anchor, carrying Excel's `editAs` when the mode
+/// is not the default: omitted for "Move and size with cells", `editAs="oneCell"` for "Move but
+/// don't size", `editAs="absolute"` for "Don't move or size". (Excel writes pictures this way;
+/// the standalone `oneCellAnchor`/`absoluteAnchor` elements are read on import but not written.)
+/// Returns the opening tag and the matching closing tag.
+fn anchor_open(sheet: &Sheet, a: &Anchor) -> (String, &'static str) {
     let px = |v: f64| ((v.max(0.0)) * EMU_PER_PX).round() as i64;
     let x1 = sheet.col_left(a.cell.col) + a.dx as f64;
     let y1 = sheet.row_top(a.cell.row) + a.dy as f64;
@@ -209,15 +279,21 @@ fn anchor_open(sheet: &Sheet, a: &Anchor) -> String {
     let tr = sheet.row_at(y2);
     let tdx = x2 - sheet.col_left(tc);
     let tdy = y2 - sheet.row_top(tr);
-    format!(
-        "<xdr:twoCellAnchor editAs=\"oneCell\"><xdr:from><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from><xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>",
+    let edit = match a.mode {
+        AnchorMode::MoveAndSize => "",
+        AnchorMode::MoveOnly => " editAs=\"oneCell\"",
+        AnchorMode::Absolute => " editAs=\"absolute\"",
+    };
+    let open = format!(
+        "<xdr:twoCellAnchor{edit}><xdr:from><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from><xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>",
         a.cell.col,
         px(a.dx as f64),
         a.cell.row,
         px(a.dy as f64),
         px(tdx),
         px(tdy)
-    )
+    );
+    (open, "</xdr:twoCellAnchor>")
 }
 
 fn xfrm(a: &Anchor, tag: &str) -> String {
@@ -244,9 +320,12 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
     );
     for (i, o) in objs.iter().enumerate() {
         let id = i + 2;
+        let close_tag;
         match o {
             Obj::Image(img, rid) => {
-                s.push_str(&anchor_open(sheet, &img.anchor));
+                let (open, close) = anchor_open(sheet, &img.anchor);
+                close_tag = close;
+                s.push_str(&open);
                 let _ = write!(
                     s,
                     "<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{id}\" name=\"Picture {}\" descr=\"{}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>",
@@ -255,8 +334,24 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     xfrm(&img.anchor, "a:xfrm")
                 );
             }
+            Obj::Chart(ch, rid) if crate::chartex::is_chartex(ch.kind) => {
+                // Chartex frames come with a fallback for readers that don't know them.
+                let (open, close) = anchor_open(sheet, &ch.anchor);
+                close_tag = close;
+                s.push_str(&open);
+                let (prefix, ns) = crate::chartex::requires(ch.kind);
+                let _ = write!(
+                    s,
+                    "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice xmlns:{prefix}=\"{ns}\" Requires=\"{prefix}\"><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2014/chartex\"><cx:chart xmlns:cx=\"http://schemas.microsoft.com/office/drawing/2014/chartex\" r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr><xdr:cNvPr id=\"0\" name=\"\"/><xdr:cNvSpPr><a:spLocks noTextEdit=\"1\"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>This chart type can't be shown by this application.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>",
+                    id - 1,
+                    xfrm(&ch.anchor, "xdr:xfrm"),
+                    xfrm(&ch.anchor, "a:xfrm")
+                );
+            }
             Obj::Chart(ch, rid) => {
-                s.push_str(&anchor_open(sheet, &ch.anchor));
+                let (open, close) = anchor_open(sheet, &ch.anchor);
+                close_tag = close;
+                s.push_str(&open);
                 let _ = write!(
                     s,
                     "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
@@ -265,7 +360,15 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                 );
             }
             Obj::Shape(sh) => {
-                s.push_str(&anchor_open(sheet, &sh.anchor));
+                let (open, close) = anchor_open(sheet, &sh.anchor);
+                close_tag = close;
+                s.push_str(&open);
+                if let Some(xml) = ink::write(sh, theme, id) {
+                    s.push_str(&xml);
+                    s.push_str("<xdr:clientData/>");
+                    s.push_str(close_tag);
+                    continue;
+                }
                 let (prst, tx) = match sh.kind {
                     ShapeKind::Rectangle => ("rect", false),
                     ShapeKind::RoundedRectangle => ("roundRect", false),
@@ -286,7 +389,9 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     let _ = write!(s, "<a:solidFill>{c}</a:solidFill>");
                 }
                 let line_c = srgb(&sh.line, theme);
-                if line_c.is_some() || sh.kind == ShapeKind::Arrow {
+                if sh.format.no_line {
+                    s.push_str("<a:ln><a:noFill/></a:ln>");
+                } else if line_c.is_some() || sh.kind == ShapeKind::Arrow {
                     s.push_str("<a:ln w=\"9525\">");
                     match line_c {
                         Some(c) => {
@@ -301,12 +406,30 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                 }
                 s.push_str("</xdr:spPr>");
                 if !sh.text.is_empty() {
-                    s.push_str("<xdr:txBody><a:bodyPr wrap=\"square\" rtlCol=\"0\" anchor=\"t\"/><a:lstStyle/>");
+                    let f = &sh.format;
+                    let anchor = match f.anchor {
+                        Some(ShapeTextAnchor::Top) => " anchor=\"t\"",
+                        Some(ShapeTextAnchor::Middle) => " anchor=\"ctr\"",
+                        Some(ShapeTextAnchor::Bottom) => " anchor=\"b\"",
+                        None if sh.kind == ShapeKind::TextBox => " anchor=\"t\"",
+                        None => "",
+                    };
+                    let _ = write!(s, "<xdr:txBody><a:bodyPr wrap=\"square\" rtlCol=\"0\"{anchor}/><a:lstStyle/>");
+                    let ppr = match f.align {
+                        None => "",
+                        Some(ShapeTextAlign::Left) => "<a:pPr algn=\"l\"/>",
+                        Some(ShapeTextAlign::Center) => "<a:pPr algn=\"ctr\"/>",
+                        Some(ShapeTextAlign::Right) => "<a:pPr algn=\"r\"/>",
+                    };
+                    let (rpr_attrs, rpr_body) = run_props(f, theme);
                     for line in sh.text.split('\n') {
                         if line.is_empty() {
-                            s.push_str("<a:p><a:endParaRPr lang=\"en-US\"/></a:p>");
+                            let _ = write!(s, "<a:p>{ppr}<a:endParaRPr lang=\"en-US\"{rpr_attrs}/></a:p>");
+                        } else if rpr_body.is_empty() {
+                            let _ = write!(s, "<a:p>{ppr}<a:r><a:rPr lang=\"en-US\"{rpr_attrs}/><a:t>{}</a:t></a:r></a:p>", esc(line));
                         } else {
-                            let _ = write!(s, "<a:p><a:r><a:rPr lang=\"en-US\"/><a:t>{}</a:t></a:r></a:p>", esc(line));
+                            let _ =
+                                write!(s, "<a:p>{ppr}<a:r><a:rPr lang=\"en-US\"{rpr_attrs}>{rpr_body}</a:rPr><a:t>{}</a:t></a:r></a:p>", esc(line));
                         }
                     }
                     s.push_str("</xdr:txBody>");
@@ -314,10 +437,40 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                 s.push_str("</xdr:sp>");
             }
         }
-        s.push_str("<xdr:clientData/></xdr:twoCellAnchor>");
+        s.push_str("<xdr:clientData/>");
+        s.push_str(close_tag);
     }
     s.push_str("</xdr:wsDr>");
     s
+}
+
+/// A text run's `a:rPr` attributes (size, bold, italic) and children in schema order (outline,
+/// fill, typeface).
+fn run_props(f: &ShapeFormat, theme: &Theme) -> (String, String) {
+    let mut attrs = String::new();
+    if let Some(sz) = f.font_size.filter(|v| v.is_finite()) {
+        let _ = write!(attrs, " sz=\"{}\"", (sz.clamp(1.0, 4000.0) * 100.0).round() as u32);
+    }
+    if f.bold {
+        attrs.push_str(" b=\"1\"");
+    }
+    if f.italic {
+        attrs.push_str(" i=\"1\"");
+    }
+    let mut body = String::new();
+    if let Some((c, w)) = &f.text_outline
+        && let Some(c) = srgb(c, theme)
+    {
+        let emu = (w.clamp(0.0, 100.0) * 12700.0).round() as u32;
+        let _ = write!(body, "<a:ln w=\"{emu}\"><a:solidFill>{c}</a:solidFill></a:ln>");
+    }
+    if let Some(c) = f.text_color.as_ref().and_then(|c| srgb(c, theme)) {
+        let _ = write!(body, "<a:solidFill>{c}</a:solidFill>");
+    }
+    if let Some(font) = &f.font {
+        let _ = write!(body, "<a:latin typeface=\"{}\"/>", esc(font));
+    }
+    (attrs, body)
 }
 
 /// File extension for an image MIME type.

@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use gridcraft_core::DateSystem;
+use gridcraft_formula::Expr;
 use serde::{Deserialize, Serialize};
 
+use crate::cell::Formula;
 use crate::sheet::Sheet;
 use crate::style::{StyleTable, Theme};
 
@@ -16,11 +18,16 @@ pub enum CalcMode {
     Manual,
 }
 
+/// File › Options › Formulas › Calculation options, stored per workbook (`<calcPr>`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalcSettings {
     pub mode: CalcMode,
+    /// Enable iterative calculation: circular references are calculated repeatedly instead of
+    /// reporting an error.
     pub iterative: bool,
+    /// Maximum Iterations, 1 to [`CalcSettings::MAX_ITERATIONS`].
     pub max_iterations: u32,
+    /// Maximum Change: iteration stops once no value in a circular reference changes by more.
     pub max_change: f64,
     /// Use precision as displayed.
     pub precision_as_displayed: bool,
@@ -28,7 +35,32 @@ pub struct CalcSettings {
 
 impl Default for CalcSettings {
     fn default() -> Self {
-        CalcSettings { mode: CalcMode::Automatic, iterative: false, max_iterations: 100, max_change: 0.001, precision_as_displayed: false }
+        CalcSettings {
+            mode: CalcMode::Automatic,
+            iterative: false,
+            max_iterations: Self::DEFAULT_ITERATIONS,
+            max_change: Self::DEFAULT_CHANGE,
+            precision_as_displayed: false,
+        }
+    }
+}
+
+impl CalcSettings {
+    pub const DEFAULT_ITERATIONS: u32 = 100;
+    pub const DEFAULT_CHANGE: f64 = 0.001;
+    /// The largest Maximum Iterations Excel accepts.
+    pub const MAX_ITERATIONS: u32 = 32_767;
+
+    /// Sets Maximum Iterations, kept within 1 to [`CalcSettings::MAX_ITERATIONS`].
+    pub fn set_max_iterations(&mut self, n: u32) {
+        self.max_iterations = n.clamp(1, Self::MAX_ITERATIONS);
+    }
+
+    /// Sets Maximum Change (its magnitude); a value that isn't finite is ignored.
+    pub fn set_max_change(&mut self, d: f64) {
+        if d.is_finite() {
+            self.max_change = d.abs();
+        }
     }
 }
 
@@ -65,10 +97,29 @@ pub struct Workbook {
     pub props: DocProps,
     /// Workbook structure protection.
     pub protected_structure: bool,
+    /// Password of the structure protection (XLSX `workbookProtection`), never the password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_password: Option<crate::PasswordHash>,
     /// Custom fill lists (Options › Custom Lists) beyond the built-in ones.
     pub custom_lists: Vec<Vec<String>>,
     /// Named cell styles (Cell Styles gallery): name → style.
     pub cell_styles: Vec<(String, crate::style::Style)>,
+    /// VBA project (`xl/vbaProject.bin`) carried through unchanged. GridCraft does not run
+    /// macros; the blob is preserved so that saving a macro-enabled workbook never destroys the
+    /// macros it arrived with. base64 in JSON. `None` = the workbook has no macros.
+    #[serde(default, with = "crate::b64::opt")]
+    pub vba_project: Option<Vec<u8>>,
+    /// Field separator of the CSV this workbook was read from, so saving it as CSV writes the same
+    /// separator back (a `;` file stays a `;` file). `None` = not read from CSV: CSV saves use `,`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv_delimiter: Option<u8>,
+    /// Unmodelled file content kept for saving (package root and workbook level). Not in JSON.
+    #[serde(skip)]
+    pub preserved: Option<Arc<crate::preserved::Preserved>>,
+    /// The folder the workbook was read from, which relative paths to linked workbooks in
+    /// `preserved` are relative to. Saving into another folder rewrites them from there. Not in JSON.
+    #[serde(skip)]
+    pub source_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Workbook {
@@ -90,8 +141,13 @@ impl Workbook {
             active_sheet: 0,
             props: DocProps::default(),
             protected_structure: false,
+            structure_password: None,
             custom_lists: vec![],
             cell_styles: vec![],
+            vba_project: None,
+            csv_delimiter: None,
+            preserved: None,
+            source_dir: None,
         }
     }
     pub fn sheet(&self, i: usize) -> Option<&Sheet> {
@@ -143,6 +199,53 @@ impl Workbook {
             .find(|n| n.scope == Some(sheet) && n.name.eq_ignore_ascii_case(name))
             .or_else(|| self.names.iter().find(|n| n.scope.is_none() && n.name.eq_ignore_ascii_case(name)))
     }
+    /// Spells calls of LAMBDA names the way the names are defined (`Double(4)`, where the
+    /// parser gives `DOUBLE(4)`: it upper-cases function names, as built-in ones are shown).
+    pub fn name_call_case(&self, e: Expr) -> Expr {
+        spell_calls(e, &self.lambda_names())
+    }
+    /// [`Workbook::name_call_case`] for every cell formula and defined name (after reading a
+    /// file).
+    pub fn apply_name_call_case(&mut self) {
+        let lambdas = self.lambda_names();
+        if lambdas.is_empty() {
+            return;
+        }
+        for sheet in self.sheets.iter_mut() {
+            let fixed: Vec<_> = sheet
+                .cells
+                .iter()
+                .filter_map(|(c, cell)| {
+                    let f = cell.formula.as_ref()?;
+                    let e = f.expr()?;
+                    let ne = spell_calls(e.clone(), &lambdas);
+                    (ne != e).then(|| (c, Formula { array: f.array, ..Formula::from_expr(ne) }))
+                })
+                .collect();
+            if fixed.is_empty() {
+                continue;
+            }
+            let sheet = Arc::make_mut(sheet);
+            for (c, f) in fixed {
+                if let Some(cell) = sheet.cells.get_mut(c) {
+                    cell.formula = Some(Arc::new(f));
+                }
+            }
+        }
+        for n in self.names.iter_mut() {
+            if let Ok(e) = gridcraft_formula::parse(&n.formula) {
+                let ne = spell_calls(e.clone(), &lambdas);
+                if ne != e {
+                    n.formula = gridcraft_formula::print(&ne);
+                }
+            }
+        }
+    }
+    /// Names of the defined names holding a LAMBDA (callable like functions).
+    fn lambda_names(&self) -> Vec<String> {
+        let is_lambda = |f: &str| f.trim_start_matches('=').trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("LAMBDA("));
+        self.names.iter().filter(|n| is_lambda(&n.formula)).map(|n| n.name.clone()).collect()
+    }
     /// Table by name across sheets: (sheet index, table index).
     pub fn table(&self, name: &str) -> Option<(usize, usize)> {
         for (si, s) in self.sheets.iter().enumerate() {
@@ -167,9 +270,26 @@ impl Workbook {
             for c in &s.tables {
                 m = m.max(c.id);
             }
+            for c in &s.slicers {
+                m = m.max(c.id);
+            }
         }
         m + 1
     }
+}
+
+/// Calls of the names in `lambdas` spelled as the names are.
+fn spell_calls(e: Expr, lambdas: &[String]) -> Expr {
+    if lambdas.is_empty() {
+        return e;
+    }
+    e.map(&mut |x| match x {
+        Expr::Call(n, args) => match lambdas.iter().find(|l| l.eq_ignore_ascii_case(&n)) {
+            Some(l) => Expr::Call(l.clone(), args),
+            None => Expr::Call(n, args),
+        },
+        other => other,
+    })
 }
 
 #[cfg(test)]

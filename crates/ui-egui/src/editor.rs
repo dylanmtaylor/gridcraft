@@ -19,6 +19,8 @@ pub const REF_COLORS: [Color32; 8] = [
 #[derive(Clone, Debug)]
 pub struct EditState {
     pub sheet: usize,
+    /// Syntax of this edit, captured when it starts (prevents a language switch reinterpreting it).
+    pub locale: gridcraft_engine::formula::FormulaLocale,
     pub cell: CellRef,
     pub text: String,
     /// Started by typing (Enter mode: arrows commit) rather than F2 (Edit mode: arrows move the caret).
@@ -46,6 +48,7 @@ impl EditState {
         let caret = text.chars().count();
         EditState {
             sheet,
+            locale: Default::default(),
             cell,
             text,
             enter_mode,
@@ -163,7 +166,8 @@ impl EditState {
                 continue;
             }
             match c {
-                ')' => depth += 1,
+                ')' | '}' | ']' => depth += 1,
+                '{' | '[' => depth -= 1,
                 '(' => {
                     if depth == 0 {
                         let name: String = chars[..i]
@@ -181,7 +185,7 @@ impl EditState {
                     }
                     depth -= 1;
                 }
-                ',' if depth == 0 => arg += 1,
+                c if c == self.locale.list_separator() && depth == 0 => arg += 1,
                 _ => {}
             }
         }
@@ -209,7 +213,7 @@ pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, 
         {
             let mut end = toks[j].end;
             let mut range = RangeRef::cell(c);
-            if let (Some(Tok::Colon), Some(Tok::Word(w2))) = (toks.get(j + 1).map(|t| &t.tok), toks.get(j + 2).map(|t| &t.tok))
+            if let (Some(Tok::Colon | Tok::Trim(_)), Some(Tok::Word(w2))) = (toks.get(j + 1).map(|t| &t.tok), toks.get(j + 2).map(|t| &t.tok))
                 && let Some(c2) = CellRef::parse(w2)
             {
                 range = RangeRef::new(c, c2);
@@ -247,9 +251,10 @@ pub fn column_completion(sheet: &gridcraft_engine::model::Sheet, at: CellRef, ty
         match sheet.value(CellRef::new(row, at.col)) {
             gridcraft_engine::core::Value::Empty => false,
             gridcraft_engine::core::Value::Text(t) => {
-                if t.to_lowercase().starts_with(&lower) && t.len() > typed.len() {
+                let folded = t.to_lowercase();
+                if folded.starts_with(&lower) && folded.len() > lower.len() {
                     match &found {
-                        Some(f) if !f.eq_ignore_ascii_case(&t) => ambiguous = true,
+                        Some(f) if f.to_lowercase() != folded => ambiguous = true,
                         None => found = Some(t.to_string()),
                         _ => {}
                     }
@@ -275,6 +280,13 @@ pub fn column_completion(sheet: &gridcraft_engine::model::Sheet, at: CellRef, ty
         n += 1;
     }
     if ambiguous { None } else { found }
+}
+
+/// The part of `full` after the `typed` prefix, counted in characters: case folding can change
+/// a character's byte length ("ß" is two bytes, "ẞ" three).
+pub fn completion_rest<'a>(full: &'a str, typed: &str) -> Option<&'a str> {
+    let start = full.char_indices().nth(typed.chars().count())?.0;
+    full.get(start..)
 }
 
 #[cfg(test)]
