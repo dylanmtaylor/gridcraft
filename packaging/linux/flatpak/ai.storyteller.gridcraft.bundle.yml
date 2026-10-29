@@ -31,6 +31,9 @@ finish-args:
   # dialog lists no printers.
   - --socket=cups
   - --system-talk-name=org.freedesktop.Avahi
+  # The user's CUPS settings, read-only: their default printer and saved options (lpoptions)
+  # and a print server named in their client.conf, which lp reaches over the network.
+  - --filesystem=~/.cups:ro
   # Open/Save dialogs use the file-chooser portal (rfd), and drag-and-drop uses the document
   # portal, so broad filesystem access isn't needed. Documents and Downloads are granted for
   # opening workbooks by path from the command line.
